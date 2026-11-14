@@ -42,18 +42,11 @@ namespace OpenUtau.Plugin.KanataWarutsuPhonemizer {
         private static readonly Regex rrSuffixRegex = new Regex(
             @"^(?<base>.+)(?<suffix> RR(?<index>[0-9]+))$",
             RegexOptions.Compiled | RegexOptions.CultureInvariant);
-        // Numeric pitch suffixes are appended to the COMPLETE alias, e.g. "- な_0".
-        // OpenUtau's Subbanks normally choose these via tone ranges. The numeric
-        // fallback below also supports Kanata Warutsu's D3/A3/E4 folders (_0/_1/_2)
-        // when the OTOs have those aliases but no subbank map has been configured.
+        // Used only when indexing RR aliases whose OTO aliases include a numeric
+        // prefix.map suffix. Actual pitch/subbank selection is delegated to OpenUtau.
         private static readonly Regex numericPitchSuffixRegex = new Regex(
             @"^(?<base>.+)_(?<index>[0-9]+)$",
             RegexOptions.Compiled | RegexOptions.CultureInvariant);
-        private static readonly Dictionary<int, int> numericPitchAnchors = new Dictionary<int, int> {
-            [0] = 50, // D3
-            [1] = 57, // A3
-            [2] = 64, // E4
-        };
         private const int MaxRrSelectionsPerAlias = 512;
         // Look at a short run of earlier selections for this alias. Recent-use weighting
         // reduces obvious clusters while preserving a genuine random choice each time.
@@ -574,7 +567,7 @@ namespace OpenUtau.Plugin.KanataWarutsuPhonemizer {
             // A manual RR alias is authoritative. Numeric pitch selection is still
             // applied after the RR index, producing aliases such as "- な RR1_0".
             if (IsExplicitRrAlias(alias)) {
-                return TryGetPitchMappedOto(alias, tone, color, out oto);
+                return TryGetPrefixMappedOto(alias, tone, color, out oto);
             }
 
             EnsureRrIndex();
@@ -588,14 +581,14 @@ namespace OpenUtau.Plugin.KanataWarutsuPhonemizer {
             // Mixed banks remain supported: if this logical alias has no RR variants,
             // use OpenUTau's ordinary mapped alias lookup exactly as before.
             if (variants == null || variants.Count == 0) {
-                return TryGetPitchMappedOto(alias, tone, color, out oto);
+                return TryGetPrefixMappedOto(alias, tone, color, out oto);
             }
 
             // Keep only variants that OpenUTau can actually map for this note/tone/color.
             // Missing numbers are never fabricated from the largest discovered RR index.
             var usable = new List<KeyValuePair<RrVariant, UOto>>();
             foreach (var variant in variants) {
-                if (TryGetPitchMappedOto(alias + variant.Suffix, tone, color, out var candidate)
+                if (TryGetPrefixMappedOto(alias + variant.Suffix, tone, color, out var candidate)
                     && candidate != null) {
                     usable.Add(new KeyValuePair<RrVariant, UOto>(variant, candidate));
                 }
@@ -616,69 +609,16 @@ namespace OpenUtau.Plugin.KanataWarutsuPhonemizer {
             return true;
         }
 
-        private bool TryGetPitchMappedOto(string alias, int tone, string color, out UOto oto) {
+        private bool TryGetPrefixMappedOto(string alias, int tone, string color, out UOto oto) {
             oto = default;
             if (singer == null || string.IsNullOrEmpty(alias)) {
                 return false;
             }
 
-            // If the user already typed a fully-qualified numeric alias, respect it.
-            if (numericPitchSuffixRegex.IsMatch(alias)) {
-                return singer.TryGetOto(alias, out oto);
-            }
-
-            // First honor OpenUtau's subbank configuration. This supports any numeric
-            // suffix (_0, _1, _2, ...), provided its tone range is configured in the singer.
-            if (singer.Subbanks != null) {
-                var matchingSubbanks = singer.Subbanks
-                    .Where(subbank => subbank != null
-                        && subbank.toneSet != null
-                        && subbank.toneSet.Contains(tone)
-                        && Regex.IsMatch(subbank.Suffix ?? string.Empty, @"^_[0-9]+$")
-                        && (string.Equals(subbank.Color ?? string.Empty, color ?? string.Empty, StringComparison.Ordinal)
-                            || (string.IsNullOrEmpty(subbank.Color) && string.IsNullOrEmpty(color))))
-                    .OrderByDescending(subbank => (subbank.Prefix ?? string.Empty).Length + (subbank.Suffix ?? string.Empty).Length);
-
-                foreach (var subbank in matchingSubbanks) {
-                    string mappedAlias = (subbank.Prefix ?? string.Empty) + alias + subbank.Suffix;
-                    if (singer.TryGetOto(mappedAlias, out oto)) {
-                        return true;
-                    }
-                }
-            }
-
-            // Fallback for the current three-pitch Kanata Warutsu layout. This is useful
-            // when OTO aliases are named "<alias>_0/1/2" but prefix.map / character.yaml
-            // has not been set up. Choose the closest recorded pitch, and only use an
-            // index that actually exists for this exact alias.
-            var available = new List<KeyValuePair<int, UOto>>();
-            var otoList = singer.Otos;
-            if (otoList != null) {
-                foreach (var entry in otoList) {
-                    if (entry == null || string.IsNullOrEmpty(entry.Alias)) {
-                        continue;
-                    }
-                    var match = numericPitchSuffixRegex.Match(entry.Alias);
-                    if (match.Success
-                        && string.Equals(match.Groups["base"].Value, alias, StringComparison.Ordinal)
-                        && int.TryParse(match.Groups["index"].Value, out int index)
-                        && numericPitchAnchors.ContainsKey(index)) {
-                        available.Add(new KeyValuePair<int, UOto>(index, entry));
-                    }
-                }
-            }
-
-            if (available.Count > 0) {
-                var selected = available
-                    .OrderBy(pair => Math.Abs((long)tone - numericPitchAnchors[pair.Key]))
-                    .ThenBy(pair => pair.Key)
-                    .First();
-                oto = selected.Value;
-                return true;
-            }
-
-            // Preserve ordinary UTAU / OpenUtau prefix.map behavior for non-numeric
-            // subbanks and for aliases that do not have numbered pitch variants.
+            // Do not guess a pitch index from note ranges or inspect OTO names here.
+            // OpenUtau loads prefix.map (and imported Voice Color/subbank mappings)
+            // into the singer's subbank data. TryGetMappedOto applies the matching
+            // prefix + alias + suffix for this tone/color and returns the actual OTO.
             return singer.TryGetMappedOto(alias, tone, color, out oto);
         }
 
@@ -725,7 +665,8 @@ namespace OpenUtau.Plugin.KanataWarutsuPhonemizer {
                 }
                 // Phonetic is OpenUTau's prefix/suffix-stripped alias when an OTO belongs
                 // to a mapped subbank. Prefer it, but also accept the literal alias if the
-                // singer implementation doesn't populate Phonetic.
+                // singer implementation doesn't populate Phonetic. The numeric suffix is
+                // stripped here only to identify RR variants, never to select a pitch.
                 Match match = null;
                 if (!string.IsNullOrEmpty(otoEntry.Phonetic)) {
                     match = rrSuffixRegex.Match(StripNumericPitchSuffix(otoEntry.Phonetic));
