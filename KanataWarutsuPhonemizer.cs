@@ -42,6 +42,11 @@ namespace OpenUtau.Plugin.KanataWarutsuPhonemizer {
         private static readonly Regex rrSuffixRegex = new Regex(
             @"^(?<base>.+)(?<suffix> RR(?<index>[0-9]+))$",
             RegexOptions.Compiled | RegexOptions.CultureInvariant);
+        // A trailing _<number> explicitly selects a pitch/subbank alias suffix.
+        // The optional RR part lets explicit aliases keep RR as their final suffix.
+        private static readonly Regex pitchSuffixRegex = new Regex(
+            @"^(?<base>.+)(?<suffix>_[0-9]+)(?<rr> RR[0-9]+)?$",
+            RegexOptions.Compiled | RegexOptions.CultureInvariant);
         private const int MaxRrSelectionsPerAlias = 512;
         // Look at a short run of earlier selections for this alias. Recent-use weighting
         // reduces obvious clusters while preserving a genuine random choice each time.
@@ -121,7 +126,7 @@ namespace OpenUtau.Plugin.KanataWarutsuPhonemizer {
             // and run the existing VCV/CVVC logic for each generated mora.
             if (notes != null && notes.Length > 0
                 && string.IsNullOrEmpty(notes[0].phoneticHint)
-                && TrySplitMultiMoraLyric(notes[0].lyric, out var morae)
+                && TrySplitMultiMoraLyric(StripPitchSuffix(notes[0].lyric), out var morae)
                 && morae.Count > 1) {
                 return ProcessMultiMora(notes, morae, prev, next, prevNeighbour, nextNeighbour, prevNeighbours);
             }
@@ -134,6 +139,7 @@ namespace OpenUtau.Plugin.KanataWarutsuPhonemizer {
             int baseCount = morae.Count / notes.Length;
             int extraCount = morae.Count % notes.Length;
             int moraIndex = 0;
+            string pitchSuffix = GetPitchSuffix(notes[0]);
             var virtualNotes = new List<Note>();
 
             // Distribute morae as evenly as possible across the lyric note and its extenders.
@@ -148,7 +154,8 @@ namespace OpenUtau.Plugin.KanataWarutsuPhonemizer {
                     int start = source.position + (int)((long)source.duration * j / count);
                     int end = source.position + (int)((long)source.duration * (j + 1) / count);
                     virtualNotes.Add(new Note {
-                        lyric = morae[moraIndex++],
+                        // Carry the original note's pitch selector onto every generated mora.
+                        lyric = morae[moraIndex++] + pitchSuffix,
                         phoneticHint = null,
                         tone = source.tone,
                         position = start,
@@ -559,6 +566,9 @@ namespace OpenUtau.Plugin.KanataWarutsuPhonemizer {
                 return false;
             }
 
+            // Apply this note's explicit pitch selector before handling a trailing RR index.
+            alias = ApplyPitchSuffix(alias, note);
+
             // A manual RR alias must be looked up literally, never randomized or suffixed again.
             if (IsExplicitRrAlias(alias)) {
                 return singer.TryGetMappedOto(alias, tone, color, out oto);
@@ -946,16 +956,68 @@ namespace OpenUtau.Plugin.KanataWarutsuPhonemizer {
             return char.IsLetter(ch) && !IsRomajiVowel(ch);
         }
 
+        private static string GetPitchSuffix(Note note) {
+            // A suffix explicitly written in the phonetic hint takes precedence.
+            // Otherwise, keep a suffix from the lyric even when a hint is present.
+            if (!string.IsNullOrEmpty(note.phoneticHint)) {
+                var hintMatch = pitchSuffixRegex.Match(note.phoneticHint.Normalize());
+                if (hintMatch.Success) {
+                    return hintMatch.Groups["suffix"].Value;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(note.lyric)) {
+                var lyricMatch = pitchSuffixRegex.Match(note.lyric.Normalize());
+                if (lyricMatch.Success) {
+                    return lyricMatch.Groups["suffix"].Value;
+                }
+            }
+            return string.Empty;
+        }
+
+        private static string StripPitchSuffix(string lyric) {
+            if (string.IsNullOrEmpty(lyric)) {
+                return lyric;
+            }
+            var match = pitchSuffixRegex.Match(lyric);
+            if (!match.Success) {
+                return lyric;
+            }
+            // Preserve a manual RR selector if the pitch suffix appears before it.
+            return match.Groups["base"].Value + match.Groups["rr"].Value;
+        }
+
+        private static string ApplyPitchSuffix(string alias, Note note) {
+            string pitchSuffix = GetPitchSuffix(note);
+            if (string.IsNullOrEmpty(alias) || string.IsNullOrEmpty(pitchSuffix)) {
+                return alias;
+            }
+
+            // Do not duplicate a selector already present in a phonetic hint/alias.
+            // RR remains the final suffix: "a ka_1 RR2", not "a ka RR2_1".
+            var rrMatch = rrSuffixRegex.Match(alias);
+            string baseAlias = rrMatch.Success ? rrMatch.Groups["base"].Value : alias;
+            string rrSuffix = rrMatch.Success ? rrMatch.Groups["suffix"].Value : string.Empty;
+            if (pitchSuffixRegex.IsMatch(baseAlias)) {
+                return alias;
+            }
+            return baseAlias + pitchSuffix + rrSuffix;
+        }
+
         private string ParseLyricFromNote(Note note) {
             var lyric = note.lyric.Normalize(); // Normalize(): measures for Unicode
             if (!string.IsNullOrEmpty(note.phoneticHint)) {
                 lyric = note.phoneticHint.Normalize();
-            } else {
+            }
 
+            // A numeric pitch selector is OTO metadata, not part of the Japanese lyric.
+            lyric = StripPitchSuffix(lyric);
+
+            if (string.IsNullOrEmpty(note.phoneticHint)) {
                 if (string.Equals(lyric, "wo", StringComparison.OrdinalIgnoreCase)) {
                     return "を";
                 }
-                
+
                 // replace (exact match)
                 if (presamp.Replace != null) {
                     foreach (var pair in presamp.Replace) {
